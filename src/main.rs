@@ -1,8 +1,12 @@
 use actix_web::{web, App, HttpServer, Responder};
 
 
+// Modules
+mod database;
+
 #[actix_web::get("/greet/{name}")]
 async fn greet(name: web::Path<String>) -> impl Responder {
+    println!("Received request for name: {}", name);
     format!("{name} Gae")
 }
 
