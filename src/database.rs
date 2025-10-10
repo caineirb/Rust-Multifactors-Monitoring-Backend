@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use log::{info, warn, error};
-use chrono::Utc;
+use chrono::{Utc, Duration};
 use rusqlite::{
     params, 
     Connection, 
@@ -13,6 +13,7 @@ use rusqlite::{
     Error as SqlError,
     ErrorCode as SqlErrorCode,
 };
+use serde::de;
 
 pub struct Token {
     pub access_token: String,
@@ -45,7 +46,7 @@ pub struct Device {
     pub group_id: i32,
     pub last_synced: String,
     pub created_at: String,
-    pub updated_at: String,
+    pub updated_at: Option<String>,
 }
 
 pub struct DatabaseManager {
@@ -444,7 +445,7 @@ impl DatabaseManager {
 
     pub fn store_devices(&self, devices_data: Vec<Device>, group_id: i32) -> SqlResult<()> {
         let mut conn: Connection = self.get_connection()?;
-        let mut trans: Transaction = conn.transaction()?;
+        let trans: Transaction = conn.transaction()?;
         let current_datetime: String = Utc::now().to_rfc3339();
 
         // Delete first existing devices for the group
@@ -454,7 +455,7 @@ impl DatabaseManager {
         )?;
 
         // Insert new devices
-        let mut insert_stmt: &str = "INSERT INTO devices (name, serial_number, mac, device_type, device_status, 
+        let insert_stmt: &str = "INSERT INTO devices (name, serial_number, mac, device_type, device_status, 
                                 status_details, local_ip, public_ip, last_online_at, 
                                 device_created_at, group_id, last_synced, created_at, updated_at) 
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);";
@@ -532,5 +533,244 @@ impl DatabaseManager {
                 Err(e)
             }
         }
+    }
+
+    pub fn get_devices(&self, group_id: Option<i32>) -> SqlResult<Vec<Device>> {
+        let conn = self.get_connection()?;
+
+        let sql = if group_id.is_some() {
+            "SELECT name, serial_number, mac, device_type, device_status, status_details, 
+                    local_ip, public_ip, last_online_at, device_created_at, group_id, 
+                    last_synced, created_at, updated_at
+            FROM devices WHERE group_id = ?1"
+        } else {
+            "SELECT name, serial_number, mac, device_type, device_status, status_details, 
+                    local_ip, public_ip, last_online_at, device_created_at, group_id, 
+                    last_synced, created_at, updated_at
+            FROM devices ORDER BY name ASC"
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+
+        // Collect into Vec<Device> immediately so we don’t return iterators with short lifetimes
+        let devices: Vec<Device> = if let Some(gid) = group_id {
+            stmt.query_map(params![gid], |row| {
+                Ok(Device {
+                    id: 0, // Not fetched
+                    name: row.get(0)?,
+                    serial_number: row.get(1)?,
+                    mac: row.get(2)?,
+                    device_type: row.get(3)?,
+                    device_status: row.get(4)?,
+                    status_details: row.get(5)?,
+                    local_ip: row.get(6)?,
+                    public_ip: row.get(7)?,
+                    last_online_at: row.get(8)?,
+                    device_created_at: row.get(9)?,
+                    group_id: row.get(10)?,
+                    last_synced: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13).ok(),
+                })
+            })?
+            .filter_map(Result::ok)
+            .collect()
+        } else {
+            stmt.query_map([], |row| {
+                Ok(Device {
+                    id: 0,
+                    name: row.get(0)?,
+                    serial_number: row.get(1)?,
+                    mac: row.get(2)?,
+                    device_type: row.get(3)?,
+                    device_status: row.get(4)?,
+                    status_details: row.get(5)?,
+                    local_ip: row.get(6)?,
+                    public_ip: row.get(7)?,
+                    last_online_at: row.get(8)?,
+                    device_created_at: row.get(9)?,
+                    group_id: row.get(10)?,
+                    last_synced: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13).ok(),
+                })
+            })?
+            .filter_map(Result::ok)
+            .collect()
+        };
+
+        info!(
+            "Fetched {} devices{}",
+            devices.len(),
+            if let Some(gid) = group_id {
+                format!(" for group {}", gid)
+            } else {
+                "".to_string()
+            }
+        );
+
+        match Ok(()) {
+            Ok(_) => Ok(devices),
+            Err(e) => {
+                error!("Failed to fetch devices{}: {}", if let Some(gid) = group_id { format!(" for group {}", gid) } else { "".to_string() }, e);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn get_sites_with_devices(&self) -> SqlResult<Vec<(Site, Vec<Device>)>> {
+        let conn = self.get_connection()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT name, groupid, latitude, longitude, last_synced, created_at FROM sites",
+        )?;
+
+        let mut sites_with_devices: Vec<(Site, Vec<Device>)> = Vec::new();
+
+        let site_rows = stmt.query_map([], |row| {
+            Ok(Site {
+                name: row.get(0)?,
+                groupid: row.get(1)?,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+                last_synced: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: None,
+            })
+        })?;
+
+        // Iterate over each site, fetch devices for its groupid
+        for site_result in site_rows {
+            match site_result {
+                Ok(site) => {
+                    let devices = self.get_devices(Some(site.groupid))?;
+                    sites_with_devices.push((site, devices));
+                }
+                Err(e) => {
+                    error!("Error mapping site row: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+
+        info!("Successfully fetched {} sites with devices", sites_with_devices.len());
+        Ok(sites_with_devices)
+    }
+
+    pub fn cleanup_old_logs(&self, days: Option<u32>) -> SqlResult<()> {
+        let cutoff_date = (Utc::now() - Duration::days(days.unwrap_or(30) as i64)).to_rfc3339(); // Default to 30 days if not specified
+        let mut conn: Connection = self.get_connection()?;
+        let trans: Transaction = conn.transaction()?;
+
+        // Perform the cleanup operation
+        let delete_logs = trans.execute(
+            "DELETE FROM api_logs WHERE created_at < ?1",
+            params![cutoff_date],
+        )?;
+
+        match delete_logs {
+            0 => info!("No old logs to clean up."),
+            n => info!("Cleaned up {} old log entries older than {}", n, cutoff_date),
+            
+        }
+
+        // Commit the transaction
+        trans.commit()?;
+        Ok(())
+    }
+
+    pub fn sync_sites_pins(&self) -> SqlResult<()> {
+        let mut conn: Connection = self.get_connection()?;
+        let trans: Transaction = conn.transaction()?;
+
+        // Get all sites
+        let mut sites_cursor = trans.prepare(
+            "SELECT name, groupid, latitude, longitude FROM sites"
+        )?;
+
+        struct tempSite {
+            name: String,
+            groupid: i32,
+            latitude: Option<f32>,
+            longitude: Option<f32>,
+        }
+        let mut sites = Vec::new();
+        let site_rows = sites_cursor.query_map([], |row| {
+            Ok(tempSite {
+                name: row.get(0)?,
+                groupid: row.get(1)?,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+            })
+        })?;
+
+        for site_result in site_rows {
+            match site_result {
+                Ok(site) => sites.push(site),
+                Err(e) => {
+                    error!("Error mapping site row: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+
+        info!("Successfully fetched {} sites", sites.len());
+        Ok(())
+    }
+
+    fn _calculate_site_status(self, conn: &Connection, group_id: i32) -> SqlResult<String> {
+        // Query all device statuses for the given group
+        let mut stmt = match conn.prepare(
+            "SELECT device_status FROM devices WHERE group_id = ?1"
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                error!("Error preparing statement for group {}: {}", group_id, e);
+                return Ok("UNKNOWN".to_string());
+            }
+        };
+
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, Option<String>>(0));
+
+        let device_statuses: Vec<String> = match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok().flatten()).collect(),
+            Err(e) => {
+                error!("Error fetching device statuses for group {}: {}", group_id, e);
+                return Ok("UNKNOWN".to_string());
+            }
+        };
+
+        // If no devices → OFF
+        if device_statuses.is_empty() {
+            return Ok("OFF".to_string());
+        }
+
+        // Count statuses
+        let mut online_count = 0;
+        let mut offline_count = 0;
+
+        for status in device_statuses.iter() {
+            let s = status.to_uppercase();
+            if ["ONLINE", "ON"].contains(&s.as_str()) {
+                online_count += 1;
+            } else if ["OFFLINE", "OFF", "NEVER_ONLINE"].contains(&s.as_str()) {
+                offline_count += 1;
+            }
+        }
+
+        let total_count = device_statuses.len();
+
+        // Determine overall site status
+        let status = if online_count == total_count {
+            "ONLINE".to_string()
+        } else if offline_count == total_count {
+            "UNKNOWN".to_string()
+        } else if offline_count > 0 {
+            "WARNING".to_string()
+        } else {
+            "WARNING".to_string()
+        };
+        
+        Ok(status)
     }
 }
