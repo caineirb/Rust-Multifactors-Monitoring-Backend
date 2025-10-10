@@ -13,6 +13,7 @@ use rusqlite::{
     Error as SqlError,
     ErrorCode as SqlErrorCode,
 };
+use std::error::Error;
 use serde::de;
 
 pub struct Token {
@@ -23,12 +24,17 @@ pub struct Token {
 
 pub struct Site {
     pub name: String,
-    pub groupid: i32,
+    pub group_id: i32,
     pub latitude: Option<f32>, // REAL is only 8-bit float in SQLite
     pub longitude: Option<f32>,
     pub last_synced: String,
     pub created_at: String,
     pub updated_at: Option<String>,
+}
+
+pub struct SitePin {
+    pub site: Site,
+    pub status: String,
 }
 
 pub struct Device {
@@ -148,7 +154,7 @@ impl DatabaseManager {
             CREATE TABLE IF NOT EXISTS sites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                groupid INTEGER NOT NULL UNIQUE,
+                group_id INTEGER NOT NULL UNIQUE,
                 latitude REAL,
                 longitude REAL,
                 last_synced DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -174,7 +180,7 @@ impl DatabaseManager {
                 last_synced DATETIME DEFAULT CURRENT_TIMESTAMP,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (group_id) REFERENCES sites (groupid)
+                FOREIGN KEY (group_id) REFERENCES sites (group_id)
             );
         ";
         // Execute all table creation statements in a single batch
@@ -349,8 +355,8 @@ impl DatabaseManager {
         for site in &sites_data {
             // Check if site is already existing on the database
             let existing_site: SqlResult<(Option<f32>, Option<f32>)> = trans.query_one(
-                "SELECT latitude, longitude FROM sites WHERE groupid = ?1",
-                params![site.groupid], {
+                "SELECT latitude, longitude FROM sites WHERE group_id = ?1",
+                params![site.group_id], {
                     |row: &Row<'_>| Ok((row.get::<_, Option<f32>>(0)?, row.get::<_, Option<f32>>(1)?))
                 }
             );
@@ -365,15 +371,15 @@ impl DatabaseManager {
                     trans.execute(
                         "UPDATE sites 
                             SET name = ?, latitude = ?, longitude = ?, last_synced = ?, updated_at = ?
-                            WHERE groupid = ?", params![site.name, latitude, longitude, current_datetime, current_datetime, site.groupid]
+                            WHERE group_id = ?", params![site.name, latitude, longitude, current_datetime, current_datetime, site.group_id]
                     )?;
                 }
                 Err(_) => {
                     // Insert new site
                     trans.execute(
-                        "INSERT INTO sites (name, groupid, latitude, longitude, last_synced, updated_at)
+                        "INSERT INTO sites (name, group_id, latitude, longitude, last_synced, updated_at)
                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)", 
-                            params![site.name, site.groupid, site.latitude, site.longitude, current_datetime, current_datetime]
+                            params![site.name, site.group_id, site.latitude, site.longitude, current_datetime, current_datetime]
                     )?;
                 }
             }
@@ -397,13 +403,13 @@ impl DatabaseManager {
         let conn: Connection = self.get_connection()?;
 
         let mut stmt: Statement = conn.prepare(
-            "SELECT name, groupid, latitude, longitude, last_synced, created_at FROM sites"
+            "SELECT name, group_id, latitude, longitude, last_synced, created_at FROM sites"
         )?;
 
         let sites: Vec<SqlResult<Site>> = stmt.query_map([], |row: &Row<'_>| {
             Ok(Site {
                 name: row.get(0)?,
-                groupid: row.get(1)?,
+                group_id: row.get(1)?,
                 latitude: row.get(2)?,
                 longitude: row.get(3)?,
                 last_synced: row.get(4)?,
@@ -421,7 +427,7 @@ impl DatabaseManager {
         let conn = self.get_connection()?;
 
         let mut stmt = conn.prepare(
-            "SELECT groupid FROM sites ORDER BY groupid ASC",
+            "SELECT group_id FROM sites ORDER BY group_id ASC",
         )?;
 
         // Map rows into Vec<i32>
@@ -622,7 +628,7 @@ impl DatabaseManager {
         let conn = self.get_connection()?;
 
         let mut stmt = conn.prepare(
-            "SELECT name, groupid, latitude, longitude, last_synced, created_at FROM sites",
+            "SELECT name, group_id, latitude, longitude, last_synced, created_at FROM sites",
         )?;
 
         let mut sites_with_devices: Vec<(Site, Vec<Device>)> = Vec::new();
@@ -630,7 +636,7 @@ impl DatabaseManager {
         let site_rows = stmt.query_map([], |row| {
             Ok(Site {
                 name: row.get(0)?,
-                groupid: row.get(1)?,
+                group_id: row.get(1)?,
                 latitude: row.get(2)?,
                 longitude: row.get(3)?,
                 last_synced: row.get(4)?,
@@ -639,11 +645,11 @@ impl DatabaseManager {
             })
         })?;
 
-        // Iterate over each site, fetch devices for its groupid
+        // Iterate over each site, fetch devices for its group_id
         for site_result in site_rows {
             match site_result {
                 Ok(site) => {
-                    let devices = self.get_devices(Some(site.groupid))?;
+                    let devices = self.get_devices(Some(site.group_id))?;
                     sites_with_devices.push((site, devices));
                 }
                 Err(e) => {
@@ -683,42 +689,100 @@ impl DatabaseManager {
         let mut conn: Connection = self.get_connection()?;
         let trans: Transaction = conn.transaction()?;
 
-        // Get all sites
-        let mut sites_cursor = trans.prepare(
-            "SELECT name, groupid, latitude, longitude FROM sites"
-        )?;
+        {
+            // Get all sites
+            let mut stmt = trans.prepare(
+                "SELECT name, group_id, latitude, longitude FROM sites"
+            )?;
 
-        struct tempSite {
-            name: String,
-            groupid: i32,
-            latitude: Option<f32>,
-            longitude: Option<f32>,
-        }
-        let mut sites = Vec::new();
-        let site_rows = sites_cursor.query_map([], |row| {
-            Ok(tempSite {
-                name: row.get(0)?,
-                groupid: row.get(1)?,
-                latitude: row.get(2)?,
-                longitude: row.get(3)?,
-            })
-        })?;
+            struct TempSite {
+                name: String,
+                group_id: i32,
+                latitude: Option<f32>,
+                longitude: Option<f32>,
+            }
 
-        for site_result in site_rows {
-            match site_result {
-                Ok(site) => sites.push(site),
-                Err(e) => {
-                    error!("Error mapping site row: {}", e);
-                    return Err(e);
+            let site_rows = stmt.query_map([], |row| {
+                Ok(TempSite {
+                    name: row.get(0)?,
+                    group_id: row.get(1)?,
+                    latitude: row.get(2)?,
+                    longitude: row.get(3)?,
+                })
+            })?;
+
+            for row in site_rows {
+                let site = row?;
+                let group_id = site.group_id;
+                let site_lat = site.latitude;
+                let site_lon = site.longitude;
+                let name = site.name;
+
+                let status = self._calculate_site_status(group_id)?;
+                let current_datetime: String = Utc::now().to_rfc3339();
+
+                // Try to fetch existing site pin
+                let existing_pin: SqlResult<(Option<f32>, Option<f32>, String)> = trans.query_row(
+                    "SELECT latitude, longitude, created_at FROM site_pins WHERE group_id = ?1",
+                    params![group_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                );
+
+                match existing_pin {
+                    Ok((existing_lat, existing_lon, _created_at)) => {
+                        // Use existing coordinates if they exist
+                        let final_lat = existing_lat.or(site_lat);
+                        let final_lon = existing_lon.or(site_lon);
+
+                        trans.execute(
+                            "UPDATE site_pins
+                            SET name = ?1, latitude = ?2, longitude = ?3, status = ?4,
+                                last_synced = ?5, updated_at = ?6
+                            WHERE group_id = ?7",
+                            params![
+                                name,
+                                final_lat,
+                                final_lon,
+                                status,
+                                current_datetime,
+                                current_datetime,
+                                group_id
+                            ],
+                        )?;
+                    }
+                    Err(e) => {
+                        // Create new pin
+                        trans.execute(
+                            "INSERT INTO site_pins
+                            (group_id, name, latitude, longitude, status, last_synced, created_at, updated_at)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                group_id,
+                                name,
+                                site_lat,
+                                site_lon,
+                                status,
+                                current_datetime,
+                                current_datetime,
+                                current_datetime
+                            ],
+                        )?;
+                    }
                 }
             }
+
+            let count: i32 = trans.query_row("SELECT COUNT(*) FROM site_pins", [], |row| row.get(0))?;
+            info!("Synced {} site pins successfully (preserving manual coordinates)", count);
         }
 
-        info!("Successfully fetched {} sites", sites.len());
+        // Commit after all successful updates
+        trans.commit()?;
         Ok(())
     }
 
-    fn _calculate_site_status(self, conn: &Connection, group_id: i32) -> SqlResult<String> {
+
+    fn _calculate_site_status(&self, group_id: i32) -> SqlResult<String> {
+        let conn: Connection = self.get_connection()?;
         // Query all device statuses for the given group
         let mut stmt = match conn.prepare(
             "SELECT device_status FROM devices WHERE group_id = ?1"
@@ -746,8 +810,8 @@ impl DatabaseManager {
         }
 
         // Count statuses
-        let mut online_count = 0;
-        let mut offline_count = 0;
+        let mut online_count: usize = 0;
+        let mut offline_count: usize = 0;
 
         for status in device_statuses.iter() {
             let s = status.to_uppercase();
@@ -772,5 +836,49 @@ impl DatabaseManager {
         };
         
         Ok(status)
+    }
+
+    pub fn get_site_pins(&self) -> SqlResult<Vec<SitePin>> {
+        let conn: Connection = self.get_connection()?;
+        let mut stmt: Statement<'_> = conn.prepare(
+            "SELECT group_id, name, latitude, longitude, status, last_synced, created_at, updated_at 
+                FROM site_pins
+                ORDER BY name ASC
+                ",
+        )?;
+        let pins = stmt.query_map(params![], |row| {
+            Ok(SitePin {
+                site: Site {
+                    group_id: row.get::<_, i32>(0)?,               // group_id
+                    name: row.get::<_, String>(1)?,            // name
+                    latitude: row.get::<_, Option<f32>>(2)?,      // latitude
+                    longitude: row.get::<_, Option<f32>>(3)?,      // longitude
+                    last_synced: row.get::<_, String>(5)?,            // last_synced
+                    created_at: row.get::<_, String>(6)?,            // created_at
+                    updated_at: row.get::<_, Option<String>>(7)?,    // updated_at
+                },
+                status: row.get::<_, String>(4)?,            // status
+            })
+        })?.collect::<SqlResult<Vec<_>>>()?;
+
+        Ok(pins)
+    }
+
+    pub fn update_site_pin_coordinates(&self, group_id: i32, latitude: Option<f32>, longitude: Option<f32>) -> SqlResult<()> {
+        let mut conn: Connection = self.get_connection()?;
+        if latitude.is_none() || longitude.is_none() {
+            warn!("No coordinates provided to update for group_id {}", group_id);
+            return Err(SqlError::InvalidQuery); // Or a more specific error
+        }
+
+        let latitude = latitude.unwrap();
+        let longitude = longitude.unwrap();
+
+        conn.execute(
+            "UPDATE site_pins SET latitude = ?1, longitude = ?2 WHERE group_id = ?3",
+            params![latitude, longitude, group_id],
+        )?;
+
+        Ok(())
     }
 }
